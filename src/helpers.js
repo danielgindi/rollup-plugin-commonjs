@@ -25,6 +25,12 @@ export function getCjsExportFromNamespace (n) {
 	return n && n.default || n;
 }
 
+export function notFoundRequire (id) {
+	var e = new Error("Cannot find module '" + id + "'.");
+	e.code = 'MODULE_NOT_FOUND';
+	throw e;
+}
+
 const DYNAMIC_REQUIRE_LOADERS = Object.create(null);
 const DYNAMIC_REQUIRE_CACHE = Object.create(null);
 const DEFAULT_PARENT_MODULE = {

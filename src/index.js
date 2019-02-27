@@ -233,8 +233,8 @@ export default function commonjs(options = {}) {
 						return null;
 					}
 
-					const transformed = transformCommonjs(
-						this.parse,
+					return transformCommonjs.call(
+						this,
 						code,
 						id,
 						entryModuleIds.indexOf(id) !== -1,
@@ -244,16 +244,16 @@ export default function commonjs(options = {}) {
 						sourceMap,
 						dynamicRequireModuleSet,
 						ast,
+						options.isMissing,
 						avoidAddingDefaultExport
-					);
-
-					if (!transformed) {
-						if (!isEsModule || isDynamicRequireModule)
-							esModulesWithoutDefaultExport[id] = true;
-						return null;
-					}
-
-					return transformed;
+					).then(transformed => {
+						if (!transformed) {
+							if (!isEsModule || isDynamicRequireModule)
+								esModulesWithoutDefaultExport[id] = true;
+							return null;
+						}
+						return transformed;
+					});
 				})
 				.catch(err => {
 					this.error(err, err.loc);
