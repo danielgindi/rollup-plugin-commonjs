@@ -2,8 +2,16 @@ import { walk } from 'estree-walker';
 import MagicString from 'magic-string';
 import { attachScopes, makeLegalIdentifier } from 'rollup-pluginutils';
 import { extractNames, flatten, isFalsy, isReference, isTruthy } from './ast-utils.js';
-import { HELPERS_ID, PROXY_PREFIX } from './helpers.js';
+import {
+	HELPERS_ID,
+	PROXY_PREFIX,
+	DYNAMIC_REGISTER_PREFIX,
+	DYNAMIC_JSON_PREFIX
+} from './helpers.js';
 import { getName } from './utils.js';
+import { resolve, dirname } from 'path';
+// TODO can this be async?
+import { sync as nodeResolveSync } from 'resolve';
 
 const reserved = 'process location abstract arguments boolean break byte case catch char class const continue debugger default delete do double else enum eval export extends false final finally float for from function goto if implements import in instanceof int interface let long native new null package private protected public return short static super switch synchronized this throw throws transient true try typeof var void volatile while with yield'.split(
 	' '
@@ -36,6 +44,10 @@ function tryParse(parse, code, id) {
 		err.message += ` in ${id}`;
 		throw err;
 	}
+}
+
+export function normalizePathSlashes(path) {
+	return path.replace(/\\/g, '/');
 }
 
 export function hasCjsKeywords(code, ignoreGlobal) {
@@ -72,8 +84,9 @@ export function transformCommonjs(
 	ignoreRequire,
 	customNamedExports,
 	sourceMap,
-	allowDynamicRequire,
-	astCache
+	dynamicRequireModuleSet,
+	astCache,
+	avoidAddingDefaultExport
 ) {
 	const ast = astCache || tryParse(parse, code, id);
 
@@ -100,6 +113,7 @@ export function transformCommonjs(
 
 	// TODO handle transpiled modules
 	let shouldWrap = /__esModule/.test(code);
+	let usesHelpers = false;
 
 	function isRequireStatement(node) {
 		if (!node) return;
@@ -131,19 +145,54 @@ export function transformCommonjs(
 	}
 
 	function getRequired(node, name) {
-		const sourceId = getRequireStringArg(node);
+		let sourceId = getRequireStringArg(node);
+		const isDynamicRegister = sourceId.startsWith(DYNAMIC_REGISTER_PREFIX);
+		if (isDynamicRegister)
+			sourceId = sourceId.substr(DYNAMIC_REGISTER_PREFIX.length);
+
 		const existing = required[sourceId];
 		if (existing === undefined) {
+			const isDynamic = hasDynamicModuleForPath(sourceId);
+
 			if (!name) {
 				do name = `require$$${uid++}`;
 				while (scope.contains(name));
 			}
 
-			sources.push(sourceId);
-			required[sourceId] = { source: sourceId, name, importsDefault: false };
+			if (isDynamicRegister && sourceId.endsWith('.json')) {
+				sourceId = DYNAMIC_JSON_PREFIX + sourceId;
+			}
+
+			if (isDynamicRegister || !isDynamic)
+				sources.push(sourceId);
+
+			required[sourceId] = { source: sourceId, name, importsDefault: false, isDynamic };
 		}
 
 		return required[sourceId];
+	}
+
+	function hasDynamicModuleForPath(source) {
+		if (!/[/\\]/.test(source)) {
+			try {
+				const resolvedPath = normalizePathSlashes(
+					nodeResolveSync(source, { basedir: dirname(id) })
+				);
+				if (dynamicRequireModuleSet.has(resolvedPath)) return true;
+			} catch (ex) {
+				// Probably a node.js internal module
+				return false;
+			}
+
+			return false;
+		}
+
+		for (const attemptExt of ['', '.js', '.json']) {
+			const resolvedPath = normalizePathSlashes(resolve(dirname(id), source + attemptExt));
+			if (dynamicRequireModuleSet.has(resolvedPath)) return true;
+		}
+
+		return false;
 	}
 
 	// do a first pass, see which names are assigned to. This is necessary to prevent
@@ -218,10 +267,21 @@ export function transformCommonjs(
 				if (isReference(node, parent) && !scope.contains(node.name)) {
 					if (node.name in uses) {
 						if (node.name === 'require') {
-							if (allowDynamicRequire) return;
+							if (isRequireStatement(parent)) {
+								magicString.appendLeft(
+									parent.end - 1,
+									',' +
+									// TODO stringify(null) looks very wrong; find a test
+										JSON.stringify(
+											dirname(id) === '.' ? null : normalizePathSlashes(dirname(id))
+										)
+								);
+							}
+
 							magicString.overwrite(node.start, node.end, `${HELPERS_NAME}.commonjsRequire`, {
 								storeName: true
 							});
+							usesHelpers = true;
 						}
 
 						uses[node.name] = true;
@@ -280,23 +340,27 @@ export function transformCommonjs(
 				return;
 			}
 
-			// if this is `var x = require('x')`, we can do `import x from 'x'`
+			// if this is `var x = require(...)`
 			if (
 				node.type === 'VariableDeclarator' &&
 				node.id.type === 'Identifier' &&
 				isStaticRequireStatement(node.init)
 			) {
-				// for now, only do this for top-level requires. maybe fix this in future
-				if (scope.parent) return;
+				if (isStaticRequireStatement(node.init)) {
+					// we can do `import x from 'x'`
+					
+					// for now, only do this for top-level requires. maybe fix this in future
+					if (scope.parent) return;
 
-				// edge case — CJS allows you to assign to imports. ES doesn't
-				if (assignedTo.has(node.id.name)) return;
+					// edge case — CJS allows you to assign to imports. ES doesn't
+					if (assignedTo.has(node.id.name)) return;
 
-				const required = getRequired(node.init, node.id.name);
-				required.importsDefault = true;
+					const required = getRequired(node.init, node.id.name);
+					required.importsDefault = true;
 
-				if (required.name === node.id.name) {
-					node._shouldRemove = true;
+					if (required.name === node.id.name&& !required.isDynamic) {
+						node._shouldRemove = true;
+					}
 				}
 			}
 
@@ -309,7 +373,22 @@ export function transformCommonjs(
 				magicString.remove(parent.start, parent.end);
 			} else {
 				required.importsDefault = true;
-				magicString.overwrite(node.start, node.end, required.name);
+
+				if (hasDynamicModuleForPath(required.source)) {
+					magicString.overwrite(
+						node.start,
+						node.end,
+						`${HELPERS_NAME}.commonjsRequire(${JSON.stringify(
+							normalizePathSlashes(required.source)
+						)}, ${JSON.stringify(
+							// TODO check if null is what we want
+							dirname(id) === '.' ? null : normalizePathSlashes(dirname(id))
+						)})`
+					);
+					usesHelpers = true;
+				} else {
+					magicString.overwrite(node.start, node.end, required.name);
+				}
 			}
 
 			node.callee._skip = true;
@@ -361,7 +440,7 @@ export function transformCommonjs(
 		return null; // not a CommonJS module
 	}
 
-	const includeHelpers = shouldWrap || uses.global || uses.require;
+	const includeHelpers = usesHelpers || shouldWrap || uses.global || uses.require;
 	const importBlock =
 		(includeHelpers ? [`import * as ${HELPERS_NAME} from '${HELPERS_ID}';`] : [])
 			.concat(
@@ -459,36 +538,41 @@ export function transformCommonjs(
 			}
 		});
 
-		if (!hasDefaultExport) {
+		if (!hasDefaultExport && !avoidAddingDefaultExport) {
 			wrapperEnd = `\n\nvar ${moduleName} = {\n${names
 				.map(({ name, deconflicted }) => `\t${name}: ${deconflicted}`)
 				.join(',\n')}\n};`;
 		}
 	}
+
 	Object.keys(namedExports)
 		.filter(key => !blacklist[key])
 		.forEach(addExport);
-
-	const defaultExport = /__esModule/.test(code)
-		? `export default ${HELPERS_NAME}.unwrapExports(${moduleName});`
-		: `export default ${moduleName};`;
-
-	const named = namedExportDeclarations
-		.filter(x => x.name !== 'default' || !hasDefaultExport)
-		.map(x => x.str);
-
-	const exportBlock =
-		'\n\n' +
-		[defaultExport]
-			.concat(named)
-			.concat(hasDefaultExport ? defaultExportPropertyAssignments : [])
-			.join('\n');
 
 	magicString
 		.trim()
 		.prepend(importBlock + wrapperStart)
 		.trim()
-		.append(wrapperEnd + exportBlock);
+		.append(wrapperEnd);
+
+	if (!avoidAddingDefaultExport) {
+		const defaultExport = /__esModule/.test(code)
+			? `export default ${HELPERS_NAME}.unwrapExports(${moduleName});`
+			: `export default ${moduleName};`;
+
+		const named = namedExportDeclarations
+			.filter(x => x.name !== 'default' || !hasDefaultExport)
+			.map(x => x.str);
+
+		const exportBlock =
+			'\n\n' +
+			[defaultExport]
+				.concat(named)
+				.concat(hasDefaultExport ? defaultExportPropertyAssignments : [])
+				.join('\n');
+
+		magicString.append(exportBlock);
+	}
 
 	code = magicString.toString();
 	const map = sourceMap ? magicString.generateMap() : null;

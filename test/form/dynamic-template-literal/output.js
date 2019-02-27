@@ -1,7 +1,7 @@
 import * as commonjsHelpers from 'commonjsHelpers';
 
 var pe = 'pe';
-var foo = commonjsHelpers.commonjsRequire(`ta${pe}`);
+var foo = commonjsHelpers.commonjsRequire(`ta${pe}`,null);
 console.log(foo);
 
 var input = {
